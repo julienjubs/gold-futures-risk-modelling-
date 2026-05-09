@@ -1,0 +1,302 @@
+---
+title: "QRM - Assignment 4 - Gold futures analysis"
+author: "Julien Jubiler"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+---
+
+Section 1: Data description.
+
+For this assignment, I will analyze daily gold futures data from March 1, 2016 to February 28, 2026, downloaded from Yahoo Finance using the get_data() function from the qrmtools R library (ticker: GC=F). Gold futures are contracts where a buyer and a seller agree to trade gold at a set price for future delivery. The ticker GC=F provides a continuous price series, Yahoo Finance automatically rolls to the next month's contract as the current one approaches expiration, which is important to keep in mind throughout the analysis as it can occasionally introduce artificial price jumps. The analysis focuses on the negative log-returns (losses) of the series. The dataset contains 2516 daily negative log-returns, split into 1516 training observations and 1000 test observations.
+
+```{r, message=FALSE, warning=FALSE}
+library(qrmtools)
+
+# Download adjusted close prices for gold futures
+gold_prices <- get_data("GC=F", from = "2016-03-01", to = "2026-02-28")
+
+# Compute negative log-returns
+log_returns <- diff(log(gold_prices))
+neg_log_returns <- -log_returns
+
+# Compute the number of data points 
+length(neg_log_returns)
+
+# Drop the first NA
+neg_log_returns <- neg_log_returns[!is.na(neg_log_returns)]
+
+plot(neg_log_returns, type = "l", main = "Negative Log-Returns of Gold Futures",
+     xlab = "Time", ylab = "Negative Log-Return")
+
+```
+
+Section 2: Training data analysis:
+
+To guide our model selection, we examined the autocorrelation structure of the training data. The ACF of the training returns showed no significant autocorrelation at any lag, suggesting that no ARMA component is needed in the mean equation. However, the ACF of the squared training returns exhibited significant autocorrelation at many lags, with a persistent pattern extending beyond lag 20. This is the signature of volatility clustering (which means large returns tend to be followed by large returns) and indicates the need for a GARCH component.
+
+Based on these observations, we compared two candidate models: a plain GARCH(1,1) with no mean model, and an AR(1)-GARCH(1,1) just in case. Both were fitted with normal innovations using the rugarch package. The information criteria (AIC, BIC, Shibata, Hannan-Quinn) all favored the simpler GARCH(1,1), confirming that the AR(1) term is unnecessary.
+
+We then examined the fitted GARCH(1,1) model. The Ljung-Box tests on both the standardized residuals and squared standardized residuals showed no remaining serial correlation or ARCH effects (all p-values above 0.47), and the Sign Bias test detected no asymmetry issues. However, the Adjusted Pearson Goodness-of-Fit test strongly rejected the normality assumption for the innovations (p-values near zero), indicating that the residuals have heavier tails than the normal distribution can capture. To address this, we refitted the GARCH(1,1) model with Student-t innovations. The information criteria improved substantially (AIC from -6.657 to -6.791), and the Goodness-of-Fit test now showed high p-values (all above 0.66), confirming that the Student-t distribution is appropriate for the innovations.
+
+We note that the Nyblom stability test rejects parameter stability, with a joint statistic of 371.88 far exceeding the 1% critical value of 1.88. The individual statistic for omega (66.69) is particularly large, suggesting structural shifts in the unconditional variance level over the training period, likely driven by the COVID crisis, the subsequent inflation surge, and interest rate hikes. However, since our forecasting procedure in Section 4 refits the model on a rolling window of 1000 observations rather than the full training sample, the impact of this instability is mitigated, as each window captures a more locally stationary regime.
+
+Our final model for the training data is therefore a GARCH(1,1) with Student-t innovations.
+
+```{r, message=FALSE, warning=FALSE}
+# We split the data between the training data and the test data 
+N <- length(neg_log_returns)
+training <- neg_log_returns[1:(N - 1000)]
+test <- neg_log_returns[(N - 999):N]
+
+#Compute the ACFs
+acf(training, main = "ACF of Training Returns")
+acf(training^2, main = "ACF of Squared Training Returns")
+
+library(rugarch)
+
+# Model 1: GARCH(1,1) with no mean model - normal for innovations 
+spec1 <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(0,0)),
+  distribution.model = "norm"
+)
+fit1 <- ugarchfit(spec1, data = training)
+
+# Model 2: AR(1)-GARCH(1,1)
+spec2 <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(1,0)),
+  distribution.model = "norm"
+)
+fit2 <- ugarchfit(spec2, data = training)
+
+# Model 3: GARCH(1,1) with no mean model - student t for the innovations 
+spec3 <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(0,0)),
+  distribution.model = "std"
+)
+fit3 <- ugarchfit(spec3, data = training)
+show(fit3)
+# Compare AIC/BIC
+infocriteria(fit1)
+infocriteria(fit2)
+infocriteria(fit3)
+
+```
+
+Section 3: VaR and ES forecasting:
+
+In this section, we describe three strategies to forecast one-day-ahead VaR and ES at the 95% and 99% levels for the negative log-returns. All three methods rely on the GARCH(1,1) model with Student-t innovations selected in Section 2. At each time point t, the model provides a one-step-ahead forecast of the conditional volatility and a series of standardized residuals. The three methods differ in how they estimate the distribution of these residuals to compute VaR and ES.
+
+Method 1: Dynamic Historical Simulation. This method uses the empirical distribution of the standardized residuals from the GARCH fit. The VaR at level alpha is obtained by taking the empirical alpha-quantile of the residuals and scaling it by the forecasted volatility. The ES is computed as the average of all residuals exceeding that quantile, again scaled by the forecasted volatility. The method is called "dynamic" because the volatility forecast updates at each time step through the GARCH model, while "historical" refers to the use of the actual past residuals rather than a parametric distribution.
+
+Method 2: Dynamic Historical Simulation with EVT. This method replaces the empirical tail estimate with a parametric model based on Extreme Value Theory. We set the threshold at the 95th percentile (eta = 0.95) of the standardized residuals. A Generalized Pareto Distribution (GPD) is fitted to the exceedances above this threshold, yielding a shape parameter xi and a scale parameter beta. The VaR and ES are then computed using the GPD-based tail formulas, scaled by the forecasted volatility. This approach is particularly valuable at the 99% level, where the empirical distribution from Method 1 may be unreliable due to the scarcity of observations in the far tail. The threshold is kept fixed at the eta-quantile throughout the analysis, as the assignment requires.
+
+Method 3: Model-based prediction with Student-t innovations. This method uses the fully parametric GARCH(1,1) model with Student-t innovations, as validated by the Goodness-of-Fit test in Section 2. The VaR is computed directly from the quantile function of the standardized Student-t distribution, scaled by the forecasted volatility. The ES is obtained from the analytical expected shortfall formula for the Student-t distribution. This approach is the most parsimonious but relies entirely on the Student-t assumption being correct.
+
+The code below verifies that the GPD fit on the training residuals is well-behaved before we proceed to the rolling forecasts in Section 4.
+
+```{r}
+library(evd)
+
+# Extract standardized residuals from the Student-t GARCH fit
+residuals <- as.numeric(residuals(fit3, standardize = TRUE))
+
+# Set threshold at 95th percentile of residuals
+eta <- 0.95
+u <- quantile(residuals, eta)
+
+# Fit GPD to exceedances above threshold
+exceed <- residuals[residuals > u] - u
+gpd_fit <- fpot(residuals, threshold = u)
+
+# Check the GPD parameters
+gpd_fit
+```
+
+Section 4: Implementation
+
+For each of the 1000 days in the test sample, we refit the GARCH(1,1) model with Student-t innovations to a rolling window of 1000 observations immediately preceding that day. From each fit, we extract the one-step-ahead volatility forecast, the standardized residuals, and the estimated parameters. We then compute the one-day-ahead VaR and ES at the 95% and 99% levels using the three methods described in Section 3. The model specification and threshold quantile level (eta = 0.95) remain fixed throughout. All 1000 GARCH refits converged successfully, producing 12,000 forecast values in total (3 methods x 2 risk measures x 2 levels x 1000 days).
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+library(evd)
+
+# Storage matrices: 1000 rows, 3 methods
+VaR_95 <- matrix(NA, nrow = 1000, ncol = 3)
+VaR_99 <- matrix(NA, nrow = 1000, ncol = 3)
+ES_95 <- matrix(NA, nrow = 1000, ncol = 3)
+ES_99 <- matrix(NA, nrow = 1000, ncol = 3)
+
+# The spec for refitting (same model, don't change)
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(0,0)),
+  distribution.model = "std"
+)
+
+# Threshold quantile level
+eta <- 0.95
+
+for (i in 1:1000) {
+  
+# Rolling window of 1000 observations before test day i
+  window <- neg_log_returns[(N - 2000 + i):(N - 1000 + i - 1)]
+  
+# Refit GARCH(1,1) with Student-t
+  fit <- tryCatch(ugarchfit(spec, data = window, solver = "hybrid"),
+                  error = function(e) NULL)
+  if (is.null(fit)) next
+  
+# Extract fitted quantities
+  mu <- coef(fit)["mu"]
+  sigma_forecast <- as.numeric(sigma(ugarchforecast(fit, n.ahead = 1)))
+  resid <- as.numeric(residuals(fit, standardize = TRUE))
+  nu <- coef(fit)["shape"]
+  
+# Method 1: Dynamic Historical Simulation 
+  VaR_95[i, 1] <- mu + sigma_forecast * quantile(resid, 0.95)
+  VaR_99[i, 1] <- mu + sigma_forecast * quantile(resid, 0.99)
+  ES_95[i, 1]  <- mu + sigma_forecast * mean(resid[resid > quantile(resid, 0.95)])
+  ES_99[i, 1]  <- mu + sigma_forecast * mean(resid[resid > quantile(resid, 0.99)])
+  
+# Method 2: Dynamic Historical Simulation with EVT 
+  u <- quantile(resid, eta)
+  gpd <- tryCatch(fpot(resid, threshold = u), error = function(e) NULL)
+  if (!is.null(gpd)) {
+    xi <- gpd$estimate["shape"]
+    beta <- gpd$estimate["scale"]
+    n_exceed <- sum(resid > u)
+    n_total <- length(resid)
+    
+# GPD-based VaR for residuals
+    VaR_95_z <- u + (beta / xi) * (((n_total / n_exceed) * (1 - 0.95))^(-xi) - 1)
+    VaR_99_z <- u + (beta / xi) * (((n_total / n_exceed) * (1 - 0.99))^(-xi) - 1)
+    
+# GPD-based ES for residuals
+    ES_95_z <- (VaR_95_z + beta - xi * u) / (1 - xi)
+    ES_99_z <- (VaR_99_z + beta - xi * u) / (1 - xi)
+    
+    VaR_95[i, 2] <- mu + sigma_forecast * VaR_95_z
+    VaR_99[i, 2] <- mu + sigma_forecast * VaR_99_z
+    ES_95[i, 2]  <- mu + sigma_forecast * ES_95_z
+    ES_99[i, 2]  <- mu + sigma_forecast * ES_99_z
+  }
+  
+# Method 3: Model-based with Student-t 
+# rugarch uses a standardized Student-t with unit variance
+  VaR_95[i, 3] <- mu + sigma_forecast * qdist("std", 0.95, mu = 0, sigma = 1, shape = nu)
+  VaR_99[i, 3] <- mu + sigma_forecast * qdist("std", 0.99, mu = 0, sigma = 1, shape = nu)
+  
+# ES for standardized Student-t
+  q95 <- qdist("std", 0.95, mu = 0, sigma = 1, shape = nu)
+  q99 <- qdist("std", 0.99, mu = 0, sigma = 1, shape = nu)
+  d95 <- ddist("std", q95, mu = 0, sigma = 1, shape = nu)
+  d99 <- ddist("std", q99, mu = 0, sigma = 1, shape = nu)
+  ES_95[i, 3] <- mu + sigma_forecast * (d95 / (1 - 0.95)) * (nu + q95^2) / (nu - 1)
+  ES_99[i, 3] <- mu + sigma_forecast * (d99 / (1 - 0.99)) * (nu + q99^2) / (nu - 1)
+  
+# Progress tracker
+  if (i %% 100 == 0) cat("Done:", i, "/ 1000\n")
+}
+```
+
+Section 5: Backtesting and evaluation of the forecast:
+
+We compare the one-day-ahead VaR and ES forecasts from the three methods against the actual observed negative log-returns in the test sample. A VaR violation occurs when the actual negative log-return exceeds the forecasted VaR.
+
+```{r}
+library(knitr)
+
+results <- data.frame(
+  Method = rep(c("1 (DHS)", "2 (EVT)", "3 (Student-t)"), each = 2),
+  Level = rep(c("95%", "99%"), 3),
+  Expected = rep(c(50, 10), 3),
+  Observed = c(45, 14, 45, 12, 66, 12),
+  Kupiec = c("Pass", "Pass", "Pass", "Pass", "Fail", "Pass"),
+  Christoffersen = c("Pass", "Pass", "Pass", "Pass", "Pass", "Pass")
+)
+
+kable(results, caption = "VaR backtest results")
+
+```
+
+At the 95% level, where we expect approximately 50 violations out of 1000 observations, Methods 1 (Dynamic HS) and 2 (EVT) both produced 45 violations, which is close to the expected count. Method 3 (Student-t) produced 66 violations, substantially more than expected, suggesting it underestimates risk at this level. At the 99% level, where we expect approximately 10 violations, Method 1 produced 14, while Methods 2 and 3 both produced 12, all reasonably close to the target. We carried out the Kupiec (unconditional coverage) and Christoffersen (conditional coverage) backtests at the 5% significance level. Methods 1 and 2 passed both tests at both confidence levels. Method 3 passed all tests except the Kupiec test at the 95% level, confirming that it produces too many violations at that level.
+
+```{r}
+violations_95 <- matrix(NA, nrow = 1000, ncol = 3)
+violations_99 <- matrix(NA, nrow = 1000, ncol = 3)
+
+for (j in 1:3) {
+  violations_95[, j] <- test > VaR_95[, j]
+  violations_99[, j] <- test > VaR_99[, j]
+}
+
+# Count violations per method
+colSums(violations_95)
+colSums(violations_99)
+
+#VaR backtests
+for (j in 1:3) {
+  cat("\n--- Method", j, "at 95% ---\n")
+  vt95 <- VaRTest(alpha = 0.05, actual = -test, VaR = -VaR_95[, j])
+  cat("Kupiec:", vt95$uc.Decision, "\n")
+  cat("Christoffersen:", vt95$cc.Decision, "\n")
+  
+  cat("\n--- Method", j, "at 99% ---\n")
+  vt99 <- VaRTest(alpha = 0.01, actual = -test, VaR = -VaR_99[, j])
+  cat("Kupiec:", vt99$uc.Decision, "\n")
+  cat("Christoffersen:", vt99$cc.Decision, "\n")
+}
+```
+
+Finally, we compared the VaR forecasts using the asymmetric tick loss function. At the 95% level, Methods 1 and 2 both achieved a tick loss of 0.001330, while Method 3 scored 0.001333. At the 99% level, Method 1 achieved the lowest loss at 0.000439, followed by Method 2 at 0.000445 and Method 3 at 0.000451. Method 1 (Dynamic Historical Simulation) is therefore the best-performing method according to this scoring function, with Method 2 (EVT) very close behind.
+
+```{r}
+# Tick loss function for VaR
+tick_loss <- function(actual, VaR, alpha) {
+  violation <- actual > VaR
+  loss <- (actual - VaR) * (alpha - (1 - violation))
+  mean(loss)
+}
+
+# Compare methods at both levels
+cat("Tick Loss at 95%:\n")
+for (j in 1:3) cat("Method", j, ":", tick_loss(test, VaR_95[, j], 0.95), "\n")
+
+cat("\nTick Loss at 99%:\n")
+for (j in 1:3) cat("Method", j, ":", tick_loss(test, VaR_99[, j], 0.99), "\n")
+
+```
+
+We also performed the ESTest from the rugarch package to backtest the ES forecasts. All three methods passed at both levels, with p-values well above 0.05. Method 1 achieved p-values of 0.177 (95%) and 0.262 (99%), Method 2 achieved 0.179 (95%) and 0.190 (99%), and Method 3 achieved 1.000 (95%) and 0.610 (99%). Notably, despite its weaker VaR performance, Method 3 produced the strongest ES estimates, suggesting it captures the average tail loss well even though the quantile location is slightly off.
+
+```{r}
+for (j in 1:3) {
+  cat("\n--- Method", j, "at 95% ---\n")
+  est95 <- ESTest(alpha = 0.05, actual = -test, ES = -ES_95[, j], VaR = -VaR_95[, j],
+                  boot = TRUE)
+  cat("p-value:", est95$p.value, "Decision:", est95$expected.exceed, "\n")
+  
+  cat("\n--- Method", j, "at 99% ---\n")
+  est99 <- ESTest(alpha = 0.01, actual = -test, ES = -ES_99[, j], VaR = -VaR_99[, j],
+                  boot = TRUE)
+  cat("p-value:", est99$p.value, "Decision:", est99$expected.exceed, "\n")
+}
+```
+
+Section 6: Conclusion:
+
+In this analysis, we modeled daily negative log-returns of gold futures (GC=F) from March 2016 to February 2026 using a GARCH(1,1) model with Student-t innovations. The model was selected based on ACF analysis, information criteria, and diagnostic tests on the training data.
+
+We implemented three methods for forecasting one-day-ahead VaR and ES: dynamic historical simulation, dynamic historical simulation with EVT (GPD threshold at the 95th percentile), and model-based prediction using the Student-t distribution. Each method was evaluated over a rolling test period of 1000 trading days. The backtesting results showed that Methods 1 and 2 passed all VaR and ES backtests at both the 95% and 99% levels. Method 3, while adequate for ES forecasting, failed the Kupiec test at the 95% VaR level due to an excess of violations (66 observed vs 50 expected). The tick loss scoring function confirmed that Method 1 (Dynamic Historical Simulation) performed best overall, with Method 2 (EVT) close behind.
+
+An interesting observation is that Method 3 underestimates VaR at the 95% level (66 violations vs 50 expected) yet produces the strongest ES estimates (ESTest p-value of 1.000 at 95%). This apparent contradiction can be explained by the estimated Student-t shape parameter of approximately 3.86, which implies very heavy tails. The 95th percentile of a t(3.86) distribution may sit slightly too low relative to the empirical residuals, causing excess VaR violations. However, the heavy tail pulls the conditional expectation beyond that percentile upward, resulting in ES estimates that accurately capture the average loss in the tail. This highlights an important distinction between VaR and ES as risk measures: a distribution can mislocate a specific quantile while still correctly characterizing the average behavior beyond it.
+
+The strong performance of the simple empirical approach (Method 1) suggests that the GARCH model captures the volatility dynamics well enough that a sophisticated tail model is not strictly necessary, the empirical distribution of the standardized residuals already provides reliable risk estimates. However, in situations where the far tail is of particular concern (e.g., regulatory capital calculations at the 99.5% or 99.9% level), the EVT-based method would likely become more valuable, as the empirical distribution becomes less reliable at such extreme quantiles.
+
+Possible improvements to the analysis could include exploring asymmetric volatility models such as EGARCH or GJR-GARCH, which allow positive and negative shocks to have different effects on volatility. Additionally, investigating the anomalous spike observed at the end of the data, potentially a futures roll artifact, and its impact on the forecasts could further refine the results.
